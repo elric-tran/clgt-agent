@@ -1,0 +1,6 @@
+.clgt-agent/
+.myagent/
+node_modules/
+out/
+*.vsix
+.vscode-test/

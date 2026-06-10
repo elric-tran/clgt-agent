@@ -1,0 +1,115 @@
+{
+  "name": "clgt-agent",
+  "displayName": "CLGT Agent",
+  "description": "CLGT Agent AI coding agent sidebar for VSCode.",
+  "version": "1.5.0",
+  "publisher": "clgt-agent",
+  "private": true,
+  "icon": "resources/icon.png",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "*"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "clgt-agent.openSettings",
+        "title": "CLGT Agent: Open Settings"
+      },
+      {
+        "command": "clgt-agent.addAgent",
+        "title": "CLGT Agent: Add Agent"
+      },
+      {
+        "command": "clgt-agent.openSidebar",
+        "title": "CLGT Agent: Open Sidebar"
+      },
+      {
+        "command": "clgt-agent.initializeWorkspace",
+        "title": "CLGT Agent: Initialize Workspace Index"
+      },
+      {
+        "command": "clgt-agent.generateSummary",
+        "title": "CLGT Agent: Generate HTML Summary"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "clgt-agent",
+          "title": "CLGT Agent",
+          "icon": "resources/icon.png"
+        }
+      ]
+    },
+    "views": {
+      "clgt-agent": [
+        {
+          "id": "clgt-agent.chatView",
+          "name": "AI Agent",
+          "type": "webview"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "CLGT Agent",
+      "properties": {
+        "clgt-agent.provider": {
+          "type": "string",
+          "default": "openai",
+          "enum": [
+            "openai",
+            "codex",
+            "copilot",
+            "vscode-lm",
+            "anthropic"
+          ],
+          "description": "Default LLM provider adapter."
+        },
+        "clgt-agent.model": {
+          "type": "string",
+          "default": "gpt-4.1",
+          "description": "Default model name."
+        },
+        "clgt-agent.autoApproveCreateFile": {
+          "type": "boolean",
+          "default": true
+        },
+        "clgt-agent.autoApproveEditFile": {
+          "type": "boolean",
+          "default": true
+        },
+        "clgt-agent.autoApproveInstall": {
+          "type": "boolean",
+          "default": false
+        },
+        "clgt-agent.autoApproveDelete": {
+          "type": "boolean",
+          "default": false
+        },
+        "clgt-agent.autoApproveGit": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    }
+  },
+  "scripts": {
+    "clean": "node scripts/clean.js",
+    "compile": "tsc -p .",
+    "build": "npm run clean && tsc -p .",
+    "check": "tsc -p . --noEmit",
+    "package": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.4.5"
+  }
+}

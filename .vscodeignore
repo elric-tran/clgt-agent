@@ -1,0 +1,8 @@
+.clgt-agent/**
+.myagent/**
+node_modules/**
+src/**
+tsconfig.json
+plan.md
+scripts/**
+README.md
