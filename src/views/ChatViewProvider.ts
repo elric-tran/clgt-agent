@@ -195,7 +195,38 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     .empty-chat { color: var(--muted); text-align: center; padding: 30px 12px; line-height: 1.5; }
 
     .composer { padding: 10px; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 8px; background: var(--panel-soft); }
+    .composer.drag-active { outline: 2px solid var(--accent); outline-offset: -2px; background: color-mix(in srgb, var(--accent) 10%, var(--panel-soft)); }
     .composer textarea { min-height: 72px; }
+    .context-files { display: flex; flex-wrap: wrap; gap: 6px; }
+    .context-files:empty { display: none; }
+    .context-chip {
+      display: inline-flex; align-items: center; gap: 5px; min-width: 0; max-width: 100%;
+      border: 1px solid var(--border); border-radius: 999px; padding: 4px 7px;
+      background: var(--panel); color: var(--vscode-foreground); font-size: 11px;
+    }
+    .context-chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .context-chip button {
+      padding: 0; width: 16px; height: 16px; border-radius: 50%;
+      color: var(--muted); background: transparent; line-height: 1;
+    }
+    .composer-input-wrap { position: relative; }
+    .context-menu {
+      position: absolute; left: 0; right: 0; bottom: calc(100% + 5px); z-index: 10;
+      max-height: 220px; overflow-y: auto; border: 1px solid var(--border); border-radius: 7px;
+      background: var(--vscode-menu-background, var(--vscode-editor-background));
+      box-shadow: 0 5px 18px color-mix(in srgb, #000 35%, transparent);
+    }
+    .context-menu.hidden { display: none; }
+    .context-option {
+      display: flex; flex-direction: column; gap: 2px; width: 100%; padding: 7px 9px;
+      border-radius: 0; text-align: left; color: var(--vscode-menu-foreground, var(--vscode-foreground));
+      background: transparent;
+    }
+    .context-option:hover, .context-option.active { background: var(--vscode-list-activeSelectionBackground); color: var(--vscode-list-activeSelectionForeground); }
+    .context-option-path { color: var(--muted); font-size: 10px; }
+    .context-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .drop-hint { color: var(--muted); font-size: 11px; line-height: 1.35; }
+    .attach-btn { flex: none; padding: 4px 8px; font-size: 11px; }
     .composer-row { display: flex; gap: 8px; }
     .composer-row button { flex: 1; min-height: 34px; }
     .send-content { display: inline-flex; align-items: center; justify-content: center; gap: 7px; }
@@ -346,8 +377,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         </details>
       </div>
       <div id="messages" class="messages"></div>
-      <div class="composer">
-        <textarea id="chatInput" placeholder="Describe the task. Press Ctrl+Enter to run the workflow."></textarea>
+      <div id="composer" class="composer">
+        <div id="contextFiles" class="context-files"></div>
+        <div class="composer-input-wrap">
+          <div id="contextMenu" class="context-menu hidden"></div>
+          <textarea id="chatInput" placeholder="Describe the task. Type @ to add files. Ctrl+Enter to run."></textarea>
+        </div>
+        <div class="context-actions">
+          <div class="drop-hint">Type @, or hold Shift while dropping files from VS Code Explorer.</div>
+          <button id="pickContextFiles" type="button" class="secondary attach-btn">Add files</button>
+        </div>
         <div class="composer-row">
           <button id="sendChat"><span id="sendContent" class="send-content">Send</span></button>
         </div>
@@ -438,7 +477,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       models: {},
       sessionId: 'session-' + Date.now().toString(36),
       isRunning: false,
-      clarificationTimer: undefined
+      clarificationTimer: undefined,
+      contextFiles: [],
+      contextResults: [],
+      contextQuery: '',
+      contextSearchTimer: undefined,
+      contextActiveIndex: 0,
+      dropRequestId: undefined
     };
 
     const $ = (id) => document.getElementById(id);
@@ -838,6 +883,151 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       $('messages').scrollTop = $('messages').scrollHeight;
     }
 
+    function renderContextFiles() {
+      const root = $('contextFiles');
+      root.innerHTML = '';
+      state.contextFiles.forEach(file => {
+        const chip = document.createElement('div');
+        chip.className = 'context-chip';
+        chip.title = file.path || file.name;
+        chip.innerHTML = '<span>' + esc(file.path || file.name) + '</span><button type="button" aria-label="Remove file" data-context-remove="' + esc(file.id) + '">×</button>';
+        root.appendChild(chip);
+      });
+    }
+
+    function addContextFile(file) {
+      if (state.contextFiles.some(item => item.id === file.id || (item.uri && item.uri === file.uri))) return;
+      if (state.contextFiles.length >= 20) {
+        setStatus('A maximum of 20 context files can be attached.');
+        return;
+      }
+      state.contextFiles.push(file);
+      renderContextFiles();
+      setStatus('Attached ' + (file.path || file.name) + '.');
+    }
+
+    function currentMention() {
+      const input = $('chatInput');
+      const beforeCursor = input.value.slice(0, input.selectionStart);
+      const match = beforeCursor.match(/(^|\\s)@([^\\s@]*)$/);
+      return match ? { query: match[2], start: beforeCursor.length - match[2].length - 1, end: beforeCursor.length } : undefined;
+    }
+
+    function closeContextMenu() {
+      state.contextResults = [];
+      state.contextActiveIndex = 0;
+      $('contextMenu').classList.add('hidden');
+      $('contextMenu').innerHTML = '';
+    }
+
+    function renderContextMenu() {
+      const menu = $('contextMenu');
+      menu.innerHTML = '';
+      if (state.contextResults.length === 0) {
+        menu.innerHTML = '<div class="context-option-path" style="padding:8px 9px;">No matching workspace files</div>';
+        menu.classList.remove('hidden');
+        return;
+      }
+      state.contextResults.forEach((file, index) => {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'context-option' + (index === state.contextActiveIndex ? ' active' : '');
+        button.dataset.contextIndex = String(index);
+        button.innerHTML = '<span>' + esc(file.name) + '</span><span class="context-option-path">' + esc(file.path) + '</span>';
+        menu.appendChild(button);
+      });
+      menu.classList.remove('hidden');
+    }
+
+    function selectContextResult(index) {
+      const file = state.contextResults[index];
+      const mention = currentMention();
+      if (!file || !mention) return;
+      const input = $('chatInput');
+      input.value = input.value.slice(0, mention.start) + input.value.slice(mention.end);
+      input.selectionStart = input.selectionEnd = mention.start;
+      addContextFile({ id: file.uri, name: file.name, path: file.path, uri: file.uri });
+      closeContextMenu();
+      input.focus();
+    }
+
+    function searchContextFromInput() {
+      const mention = currentMention();
+      clearTimeout(state.contextSearchTimer);
+      if (!mention) {
+        closeContextMenu();
+        return;
+      }
+      state.contextQuery = mention.query;
+      state.contextSearchTimer = setTimeout(() => {
+        post({ type: 'chat:contextSearch', query: mention.query });
+      }, 120);
+    }
+
+    async function addDroppedFiles(fileList) {
+      const files = Array.from(fileList || []);
+      for (const file of files) {
+        if (file.path) continue;
+        if (file.size > 100000) {
+          setStatus('Skipped ' + file.name + ': file is larger than 100 KB.');
+          continue;
+        }
+        const content = await file.text();
+        if (content.includes('\\0')) {
+          setStatus('Skipped ' + file.name + ': binary files are not supported.');
+          continue;
+        }
+        addContextFile({
+          id: 'drop-' + file.name + '-' + file.size + '-' + file.lastModified,
+          name: file.name,
+          path: file.webkitRelativePath || file.name,
+          content
+        });
+      }
+    }
+
+    function addTransferValues(values, rawValue, jsonArray) {
+      if (!rawValue) return;
+      if (jsonArray) {
+        try {
+          const parsed = JSON.parse(rawValue);
+          if (Array.isArray(parsed)) {
+            parsed.forEach(value => {
+              if (typeof value === 'string' && value.trim()) values.add(value.trim());
+            });
+            return;
+          }
+        } catch {}
+      }
+      rawValue.split(/\\r?\\n/).forEach(value => {
+        const trimmed = value.trim();
+        if (trimmed && !trimmed.startsWith('#')) values.add(trimmed);
+      });
+    }
+
+    function resolveDroppedWorkspaceFiles(dataTransfer) {
+      const values = new Set();
+      Array.from(dataTransfer.files || []).forEach(file => {
+        if (file.path) values.add(file.path);
+      });
+      addTransferValues(values, dataTransfer.getData('CodeFiles'), true);
+      addTransferValues(values, dataTransfer.getData('ResourceURLs'), true);
+      addTransferValues(values, dataTransfer.getData('application/vnd.code.uri-list'), false);
+      addTransferValues(values, dataTransfer.getData('text/uri-list'), false);
+      const plainText = dataTransfer.getData('text/plain');
+      if (/^(?:file:|[a-z]:[\\\\/]|\\\\\\\\)/i.test(plainText.trim())) {
+        addTransferValues(values, plainText, false);
+      }
+      if (values.size === 0) return 0;
+      state.dropRequestId = 'drop-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7);
+      post({
+        type: 'chat:contextResolveDrop',
+        requestId: state.dropRequestId,
+        values: Array.from(values)
+      });
+      return values.size;
+    }
+
     function renderClarification(message) {
       clearInterval(state.clarificationTimer);
       document.querySelectorAll('.interaction-card').forEach(item => item.remove());
@@ -959,8 +1149,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         return;
       }
       const content = $('chatInput').value.trim();
-      if (!content) return;
+      if (!content && state.contextFiles.length === 0) return;
       $('chatInput').value = '';
+      const files = state.contextFiles.slice();
+      state.contextFiles = [];
+      renderContextFiles();
+      closeContextMenu();
       setRunning(true);
       showThinking(true);
       post({
@@ -970,16 +1164,78 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         workflowId: $('chatWorkflow').value,
         providerId: $('chatProvider')?.value,
         model: $('chatModel')?.value,
-        taskRoutes: collectTaskRoutes()
+        taskRoutes: collectTaskRoutes(),
+        files
       });
     });
 
+    $('chatInput').addEventListener('input', searchContextFromInput);
     $('chatInput').addEventListener('keydown', (e) => {
+      if (!$('contextMenu').classList.contains('hidden')) {
+        if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+          e.preventDefault();
+          const direction = e.key === 'ArrowDown' ? 1 : -1;
+          state.contextActiveIndex = Math.max(0, Math.min(state.contextResults.length - 1, state.contextActiveIndex + direction));
+          renderContextMenu();
+          return;
+        }
+        if (e.key === 'Enter' && state.contextResults.length > 0) {
+          e.preventDefault();
+          selectContextResult(state.contextActiveIndex);
+          return;
+        }
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          closeContextMenu();
+          return;
+        }
+      }
       if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
         e.preventDefault();
         $('sendChat').click();
       }
     });
+    $('contextMenu').addEventListener('mousedown', (event) => {
+      const option = event.target.closest('[data-context-index]');
+      if (!option) return;
+      event.preventDefault();
+      selectContextResult(Number(option.dataset.contextIndex));
+    });
+    $('contextFiles').addEventListener('click', (event) => {
+      const button = event.target.closest('[data-context-remove]');
+      if (!button) return;
+      state.contextFiles = state.contextFiles.filter(file => file.id !== button.dataset.contextRemove);
+      renderContextFiles();
+    });
+    $('pickContextFiles').addEventListener('click', () => {
+      post({ type: 'chat:contextPick' });
+    });
+    document.addEventListener('dragenter', (event) => {
+      if (!event.dataTransfer) return;
+      event.preventDefault();
+      $('composer').classList.add('drag-active');
+    }, true);
+    document.addEventListener('dragover', (event) => {
+      event.preventDefault();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
+      $('composer').classList.add('drag-active');
+    }, true);
+    document.addEventListener('dragleave', (event) => {
+      if (event.relatedTarget === null) $('composer').classList.remove('drag-active');
+    }, true);
+    document.addEventListener('drop', async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      $('composer').classList.remove('drag-active');
+      const workspaceValueCount = resolveDroppedWorkspaceFiles(event.dataTransfer);
+      const localFileCount = event.dataTransfer.files?.length || 0;
+      setStatus(
+        workspaceValueCount || localFileCount
+          ? 'Adding dropped file context...'
+          : 'Drop received, but VS Code did not provide any file data.'
+      );
+      await addDroppedFiles(event.dataTransfer.files);
+    }, true);
 
     $('detectModelsTop').addEventListener('click', () => {
       post({ type: 'providers:copilotModels' });
@@ -1071,7 +1327,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           renderAll();
           break;
         case 'providers:connect:result':
-          setStatus(msg.provider.name + ' connected.');
+          setStatus(msg.provider.name + ' connected. Default model: ' + (msg.provider.defaultModel || 'auto') + '.');
           break;
         case 'providers:test:result':
           setStatus(msg.success ? 'Provider test passed.' : ('Provider test failed: ' + (msg.error || 'unknown')));
@@ -1162,6 +1418,38 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           showThinking(false);
           setStatus('Error: ' + msg.error);
           addMessage('system', 'Error: ' + msg.error);
+          break;
+        case 'chat:contextSearch:result':
+          if (msg.query !== state.contextQuery || !currentMention()) break;
+          state.contextResults = msg.files.filter(file => !state.contextFiles.some(item => item.uri === file.uri));
+          state.contextActiveIndex = 0;
+          renderContextMenu();
+          break;
+        case 'chat:contextResolveDrop:result':
+          if (msg.requestId !== state.dropRequestId) break;
+          state.dropRequestId = undefined;
+          msg.files.forEach(file => addContextFile({
+            id: file.uri,
+            name: file.name,
+            path: file.path,
+            uri: file.uri
+          }));
+          if (msg.files.length === 0 && state.contextFiles.length === 0) {
+            setStatus('No dropped workspace files could be resolved.');
+          } else if (msg.files.length > 0) {
+            setStatus('Added ' + msg.files.length + ' dropped workspace file(s) as context.');
+          }
+          break;
+        case 'chat:contextPick:result':
+          msg.files.forEach(file => addContextFile({
+            id: file.uri,
+            name: file.name,
+            path: file.path,
+            uri: file.uri
+          }));
+          if (msg.files.length > 0) {
+            setStatus('Added ' + msg.files.length + ' selected file(s) as context.');
+          }
           break;
         case 'repo:index:result':
           setStatus('Indexed ' + msg.fileCount + ' files, ' + msg.symbolCount + ' symbols.');

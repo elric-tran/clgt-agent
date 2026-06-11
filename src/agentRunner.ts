@@ -3,7 +3,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { ChangeLog } from './changeLog';
 import { buildIndex } from './indexer';
-import { AIAgentProfile, ChatMessage, ProviderConfig, TaskModelRoute } from './models';
+import { AIAgentProfile, ChatFileContext, ChatMessage, ProviderConfig, TaskModelRoute } from './models';
 import { completeWithProvider } from './providers';
 import { generateSummary } from './summary';
 import { getAgentRoot, getWorkspaceRoot, readText } from './storage';
@@ -43,6 +43,7 @@ export class AgentRunner {
     sessionId: string,
     content: string,
     workflowId: string | undefined,
+    files: ChatFileContext[],
     emit: (message: ChatMessage) => void,
     thinking: (active: boolean, node?: WorkflowNodeType) => void,
     requestClarification: (
@@ -68,6 +69,8 @@ export class AgentRunner {
         context = getRepositoryContext();
       }
     }
+    const fileContext = await this.getAttachedFileContext(files);
+    context = [context, fileContext].filter(Boolean).join('\n\n');
 
     const task = `${agent.description ? `${agent.description}\n\n` : ''}${content}`;
     const results: Array<{ node: WorkflowNodeType; content: string }> = [];
@@ -93,7 +96,7 @@ export class AgentRunner {
         if (node === 'architect') {
           prompt = this.buildArchitectPrompt(task, context, clarificationAnswers);
         } else if (node === 'code' && planPath) {
-          prompt = this.buildCodePrompt(task, planPath);
+          prompt = this.buildCodePrompt(task, planPath, fileContext);
         }
 
         const result = await completeWithProvider({
@@ -153,6 +156,7 @@ export class AgentRunner {
             sessionId,
             task,
             agent,
+            fileContext,
             emit,
             thinking,
             requestApproval,
@@ -226,7 +230,7 @@ export class AgentRunner {
     ].filter(Boolean).join('\n');
   }
 
-  private buildCodePrompt(task: string, planPath: string): string {
+  private buildCodePrompt(task: string, planPath: string, fileContext = ''): string {
     const plan = readText(planPath);
     if (!plan) {
       throw new Error(`The canonical plan file could not be read: ${planPath}`);
@@ -242,6 +246,7 @@ export class AgentRunner {
       'Do not return markdown fences or explanations.',
       '',
       plan,
+      fileContext ? `\n${fileContext}` : '',
       '',
       'Relevant workspace files:',
       this.getCodeContext(plan)
@@ -294,6 +299,7 @@ export class AgentRunner {
     sessionId: string,
     task: string,
     agent: AIAgentProfile,
+    fileContext: string,
     emit: (message: ChatMessage) => void,
     thinking: (active: boolean, node?: WorkflowNodeType) => void,
     requestApproval: (items: string[], autoApproved: boolean) => void,
@@ -356,7 +362,7 @@ export class AgentRunner {
       const coder = await this.getNodeClient(agent, 'code');
       thinking(true, 'code');
       const codeResponse = await completeWithProvider({
-        prompt: this.buildCodePrompt(task, fixPlanPath),
+        prompt: this.buildCodePrompt(task, fixPlanPath, fileContext),
         agent: coder.agent,
         provider: coder.provider,
         token
@@ -528,6 +534,36 @@ export class AgentRunner {
       totalLength += content.length;
     }
     return sections.join('\n\n');
+  }
+
+  private async getAttachedFileContext(files: ChatFileContext[]): Promise<string> {
+    const sections: string[] = [];
+    let totalLength = 0;
+
+    for (const file of files.slice(0, 20)) {
+      let content = file.content;
+      if (content === undefined && file.uri) {
+        try {
+          const uri = vscode.Uri.parse(file.uri);
+          if (uri.scheme !== 'file') continue;
+          const bytes = await vscode.workspace.fs.readFile(uri);
+          if (bytes.byteLength > 100000) continue;
+          if (bytes.subarray(0, Math.min(bytes.byteLength, 8000)).includes(0)) continue;
+          content = Buffer.from(bytes).toString('utf8');
+        } catch {
+          continue;
+        }
+      }
+      if (!content || content.length > 100000 || totalLength + content.length > 300000) continue;
+
+      const label = file.path || file.name;
+      sections.push(`## Attached file: ${label}\n${content}`);
+      totalLength += content.length;
+    }
+
+    return sections.length > 0
+      ? `User-selected file context:\n${sections.join('\n\n')}`
+      : '';
   }
 
   private waitForClarification(

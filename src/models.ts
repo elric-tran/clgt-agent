@@ -60,6 +60,20 @@ export type ChatMessage = {
   createdAt: string;
 };
 
+export type ChatFileContext = {
+  id: string;
+  name: string;
+  path?: string;
+  uri?: string;
+  content?: string;
+};
+
+export type WorkspaceFileMatch = {
+  name: string;
+  path: string;
+  uri: string;
+};
+
 export type CreateAgentInput = Partial<
   Pick<
     AIAgentProfile,
@@ -110,7 +124,11 @@ export type WebviewMessage =
       providerId?: string;
       model?: string;
       taskRoutes?: Partial<Record<WorkflowNodeType, TaskModelRoute>>;
+      files?: ChatFileContext[];
     }
+  | { type: 'chat:contextSearch'; query: string }
+  | { type: 'chat:contextResolveDrop'; requestId: string; values: string[] }
+  | { type: 'chat:contextPick' }
   | { type: 'chat:stop'; sessionId: string }
   | { type: 'chat:clarificationResponse'; sessionId: string; answers: string[] }
   | { type: 'chat:approvalResponse'; sessionId: string; approved: boolean }
@@ -154,6 +172,9 @@ export type ExtensionMessage =
     }
   | { type: 'chat:approval'; sessionId: string; items: string[]; autoApproved: boolean }
   | { type: 'chat:error'; sessionId: string; error: string }
+  | { type: 'chat:contextSearch:result'; query: string; files: WorkspaceFileMatch[] }
+  | { type: 'chat:contextResolveDrop:result'; requestId: string; files: WorkspaceFileMatch[] }
+  | { type: 'chat:contextPick:result'; files: WorkspaceFileMatch[] }
   | { type: 'workflows:list:result'; workflows: WorkflowTemplate[] }
   | { type: 'prompts:list:result'; prompts: Array<{ id: string; name: string; content: string }> }
   | { type: 'repo:index:result'; fileCount: number; symbolCount: number }

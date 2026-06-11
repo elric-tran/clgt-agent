@@ -18,6 +18,8 @@ import { BUILT_IN_WORKFLOWS, DEFAULT_PROMPTS } from './workflows';
 import { readUserConfig, writeUserConfig } from './userConfig';
 
 export class MessageRouter {
+  private workspaceFileCache?: Thenable<Array<{ name: string; path: string; uri: string }>>;
+
   constructor(
     private readonly providerStore: ProviderStore,
     private readonly agentStore: AgentStore,
@@ -48,8 +50,14 @@ export class MessageRouter {
         if (message.providerType === 'codex') {
           post({ type: 'status', message: 'Opening ChatGPT sign-in in your browser...' });
         }
-        const provider = await this.connectProvider(message.providerType, message.payload);
+        const { provider, detectedModels } = await this.connectProvider(message.providerType, message.payload);
         post({ type: 'providers:connect:result', provider });
+        if (message.providerType === 'copilot' && detectedModels) {
+          post({ type: 'providers:copilotModels:result', models: detectedModels });
+        }
+        if (message.providerType === 'vscode-lm' && detectedModels) {
+          post({ type: 'providers:vscodeLmModels:result', models: detectedModels });
+        }
         post({ type: 'providers:list:result', providers: await this.providerStore.listProviders() });
         return;
       }
@@ -157,6 +165,7 @@ export class MessageRouter {
             message.sessionId,
             message.content,
             message.workflowId,
+            message.files || [],
             (chatMessage) => post({ type: 'chat:message', message: chatMessage }),
             (active, node) => post({ type: 'chat:thinking', sessionId: message.sessionId, active, node }),
             (questions, timeoutMs) => post({
@@ -185,6 +194,38 @@ export class MessageRouter {
           }
         }
         return;
+
+      case 'chat:contextSearch':
+        post({
+          type: 'chat:contextSearch:result',
+          query: message.query,
+          files: await this.searchWorkspaceFiles(message.query)
+        });
+        return;
+
+      case 'chat:contextResolveDrop':
+        post({
+          type: 'chat:contextResolveDrop:result',
+          requestId: message.requestId,
+          files: this.resolveDroppedWorkspaceFiles(message.values)
+        });
+        return;
+
+      case 'chat:contextPick': {
+        const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri;
+        const uris = await vscode.window.showOpenDialog({
+          defaultUri: workspaceRoot,
+          canSelectFiles: true,
+          canSelectFolders: false,
+          canSelectMany: true,
+          openLabel: 'Add as chat context'
+        });
+        post({
+          type: 'chat:contextPick:result',
+          files: (uris || []).map((uri) => this.toWorkspaceFileMatch(uri))
+        });
+        return;
+      }
 
       case 'chat:stop':
         if (this.agentRunner.stop(message.sessionId)) {
@@ -263,7 +304,13 @@ export class MessageRouter {
     }
   }
 
-  private async connectProvider(type: ProviderType, payload: ProviderConnectPayload): Promise<ProviderConfig> {
+  private async connectProvider(
+    type: ProviderType,
+    payload: ProviderConnectPayload
+  ): Promise<{
+    provider: ProviderConfig;
+    detectedModels?: Array<{ id: string; name: string; family: string; vendor: string }>;
+  }> {
     if (type === 'codex') {
       await loginCodex();
       if (!await isCodexLoggedIn()) {
@@ -281,8 +328,14 @@ export class MessageRouter {
       }
     }
 
+    const detectedModels = type === 'copilot'
+      ? await listCopilotModels()
+      : type === 'vscode-lm'
+        ? await listVSCodeLmModels()
+        : undefined;
+    const defaultModel = detectedModels?.[0]?.id || payload.defaultModel || DEFAULT_MODELS[type][0];
     const provider = await this.providerStore.upsertProvider(type, {
-      defaultModel: payload.defaultModel || DEFAULT_MODELS[type][0],
+      defaultModel,
       baseUrl: payload.baseUrl,
       isConnected: type === 'codex' || type === 'copilot' || type === 'vscode-lm' || type === 'ollama' || type === 'lmstudio' || Boolean(payload.apiKey)
     });
@@ -292,7 +345,7 @@ export class MessageRouter {
     }
 
     await this.saveUserConfig();
-    return provider;
+    return { provider, detectedModels };
   }
 
   private async loadUserConfig(): Promise<void> {
@@ -366,5 +419,71 @@ export class MessageRouter {
         error: error instanceof Error ? error.message : String(error)
       });
     }
+  }
+
+  private async searchWorkspaceFiles(query: string): Promise<Array<{ name: string; path: string; uri: string }>> {
+    const normalizedQuery = query.trim().toLowerCase();
+    const cache = this.workspaceFileCache ??= vscode.workspace.findFiles(
+      '**/*',
+      '**/{node_modules,.git,out,dist,build,.clgt-agent}/**',
+      5000
+    ).then((uris) => uris.map((uri) => {
+      const workspaceFolder = vscode.workspace.getWorkspaceFolder(uri);
+      const relativePath = workspaceFolder
+        ? vscode.workspace.asRelativePath(uri, false).replace(/\\/g, '/')
+        : uri.fsPath.replace(/\\/g, '/');
+      return {
+        name: relativePath.split('/').pop() || relativePath,
+        path: relativePath,
+        uri: uri.toString()
+      };
+    }));
+    return (await cache)
+      .filter((file) => !normalizedQuery || file.path.toLowerCase().includes(normalizedQuery))
+      .sort((left, right) => {
+        const leftPath = left.path.toLowerCase();
+        const rightPath = right.path.toLowerCase();
+        const leftStarts = leftPath.startsWith(normalizedQuery) ? 0 : 1;
+        const rightStarts = rightPath.startsWith(normalizedQuery) ? 0 : 1;
+        return leftStarts - rightStarts || leftPath.localeCompare(rightPath);
+      })
+      .slice(0, 50);
+  }
+
+  private resolveDroppedWorkspaceFiles(values: string[]): Array<{ name: string; path: string; uri: string }> {
+    const matches = new Map<string, { name: string; path: string; uri: string }>();
+
+    for (const value of values) {
+      const trimmed = value.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+
+      let uri: vscode.Uri;
+      try {
+        const isWindowsPath = /^[a-z]:[\\/]/i.test(trimmed) || trimmed.startsWith('\\\\');
+        uri = isWindowsPath || !/^[a-z][a-z0-9+.-]*:/i.test(trimmed)
+          ? vscode.Uri.file(trimmed)
+          : vscode.Uri.parse(trimmed);
+      } catch {
+        continue;
+      }
+      if (uri.scheme !== 'file') continue;
+
+      const file = this.toWorkspaceFileMatch(uri);
+      matches.set(uri.toString(), file);
+    }
+
+    return [...matches.values()];
+  }
+
+  private toWorkspaceFileMatch(uri: vscode.Uri): { name: string; path: string; uri: string } {
+    const workspaceFolder = vscode.workspace.getWorkspaceFolder(uri);
+    const path = workspaceFolder
+      ? vscode.workspace.asRelativePath(uri, false).replace(/\\/g, '/')
+      : uri.fsPath.replace(/\\/g, '/');
+    return {
+      name: path.split('/').pop() || path,
+      path,
+      uri: uri.toString()
+    };
   }
 }
