@@ -11,10 +11,11 @@ import {
 } from './models';
 import { isCodexLoggedIn, listCopilotModels, listVSCodeLmModels, loginCodex, testProviderConnection } from './providers';
 import { buildIndex } from './indexer';
+import { loadInstructionFiles, scanInstructionFiles } from './instructionRegistry';
 import { generateSummary } from './summary';
 import { AgentStore, ProviderStore, SecretStore } from './stores';
 import { runCommand } from './tools';
-import { BUILT_IN_WORKFLOWS, DEFAULT_PROMPTS } from './workflows';
+import { BUILT_IN_WORKFLOWS, DEFAULT_PROMPTS, WorkflowTemplate } from './workflows';
 import { readUserConfig, writeUserConfig } from './userConfig';
 
 export class MessageRouter {
@@ -32,13 +33,16 @@ export class MessageRouter {
     switch (message.type) {
       case 'app:init':
         await this.loadUserConfig();
+        const instructions = loadInstructionFiles();
         post({
           type: 'app:init:result',
           providers: await this.providerStore.listProviders(),
           agents: await this.agentStore.listAgents(),
           activeAgentId: await this.agentStore.getActiveAgentId(),
-          workflows: BUILT_IN_WORKFLOWS,
-          models: DEFAULT_MODELS
+          workflows: await this.listWorkflows(),
+          models: DEFAULT_MODELS,
+          instructions: instructions.files.map(this.toInstructionSummary),
+          instructionsScannedAt: instructions.scannedAt
         });
         return;
 
@@ -161,11 +165,13 @@ export class MessageRouter {
           await this.saveUserConfig();
         }
         try {
+          const workflow = (await this.listWorkflows()).find((item) => item.id === message.workflowId);
           await this.agentRunner.run(
             message.sessionId,
             message.content,
-            message.workflowId,
+            workflow,
             message.files || [],
+            message.instructionIds || [],
             (chatMessage) => post({ type: 'chat:message', message: chatMessage }),
             (active, node) => post({ type: 'chat:thinking', sessionId: message.sessionId, active, node }),
             (questions, timeoutMs) => post({
@@ -242,8 +248,39 @@ export class MessageRouter {
         return;
 
       case 'workflows:list':
-        post({ type: 'workflows:list:result', workflows: BUILT_IN_WORKFLOWS });
+        post({ type: 'workflows:list:result', workflows: await this.listWorkflows() });
         return;
+
+      case 'workflows:save': {
+        const workflow = this.validateCustomWorkflow(message.workflow);
+        const config = readUserConfig();
+        const workflows = (config?.workflows || []).filter((item) => item.id !== workflow.id);
+        workflows.push(workflow);
+        await this.saveUserConfig(workflows);
+        post({ type: 'workflows:save:result', workflow });
+        post({ type: 'workflows:list:result', workflows: await this.listWorkflows() });
+        return;
+      }
+
+      case 'workflows:delete': {
+        const config = readUserConfig();
+        const workflows = (config?.workflows || []).filter((item) => item.id !== message.workflowId);
+        const agents = await this.agentStore.listAgents();
+        for (const agent of agents) {
+          if (agent.workflowId === message.workflowId) {
+            await this.agentStore.updateAgent(agent.id, { workflowId: BUILT_IN_WORKFLOWS[0].id });
+          }
+        }
+        await this.saveUserConfig(workflows);
+        post({ type: 'workflows:delete:result', workflowId: message.workflowId });
+        post({ type: 'workflows:list:result', workflows: await this.listWorkflows() });
+        post({
+          type: 'agents:list:result',
+          agents: await this.agentStore.listAgents(),
+          activeAgentId: await this.agentStore.getActiveAgentId()
+        });
+        return;
+      }
 
       case 'prompts:list':
         post({
@@ -255,6 +292,16 @@ export class MessageRouter {
       case 'repo:index': {
         const result = await buildIndex();
         post({ type: 'repo:index:result', fileCount: result.fileCount, symbolCount: result.symbolCount });
+        return;
+      }
+
+      case 'instructions:refresh': {
+        const result = scanInstructionFiles();
+        post({
+          type: 'instructions:list:result',
+          files: result.files.map(this.toInstructionSummary),
+          scannedAt: result.scannedAt
+        });
         return;
       }
 
@@ -358,12 +405,59 @@ export class MessageRouter {
     }
   }
 
-  private async saveUserConfig(): Promise<string> {
+  private async saveUserConfig(workflows?: WorkflowTemplate[]): Promise<string> {
+    const current = readUserConfig();
     return writeUserConfig({
       providers: await this.providerStore.listProviders(),
       agents: await this.agentStore.listAgents(),
-      activeAgentId: await this.agentStore.getActiveAgentId()
+      activeAgentId: await this.agentStore.getActiveAgentId(),
+      workflows: workflows ?? current?.workflows ?? []
     });
+  }
+
+  private async listWorkflows(): Promise<WorkflowTemplate[]> {
+    return [...BUILT_IN_WORKFLOWS, ...(readUserConfig()?.workflows || [])];
+  }
+
+  private validateCustomWorkflow(input: WorkflowTemplate): WorkflowTemplate {
+    const id = input.id?.trim() || `mode-${Date.now().toString(36)}`;
+    if (BUILT_IN_WORKFLOWS.some((item) => item.id === id)) {
+      throw new Error('Built-in modes cannot be overwritten.');
+    }
+    if (!input.name?.trim()) throw new Error('Mode name is required.');
+    const steps = (input.steps || []).map((step, index) => ({
+      ...step,
+      id: step.id?.trim() || `step-${index + 1}`,
+      name: step.name?.trim() || `Step ${index + 1}`,
+      kind: ['prompt', 'architect', 'code'].includes(step.kind) ? step.kind : 'prompt',
+      prompt: step.prompt?.trim() || 'Complete this step using the task and previous results.',
+      providerId: step.providerId?.trim(),
+      model: step.model?.trim(),
+      loop: step.loop ? {
+        ...step.loop,
+        condition: ['always', 'contains', 'not_contains'].includes(step.loop.condition)
+          ? step.loop.condition
+          : 'contains',
+        maxIterations: Math.max(1, Math.min(10, Number(step.loop.maxIterations) || 1))
+      } : undefined
+    }));
+    if (steps.length === 0) throw new Error('A mode must contain at least one step.');
+    if (steps.length > 30) throw new Error('A mode can contain at most 30 steps.');
+    const ids = new Set(steps.map((step) => step.id));
+    if (ids.size !== steps.length) throw new Error('Step IDs must be unique.');
+    for (const step of steps) {
+      if (!step.providerId || !step.model) throw new Error(`Select a provider and model for ${step.name}.`);
+      if (step.loop && !ids.has(step.loop.targetStepId)) {
+        throw new Error(`Loop target for ${step.name} does not exist.`);
+      }
+    }
+    return {
+      id,
+      name: input.name.trim(),
+      nodes: steps.map((step) => step.kind === 'prompt' ? 'custom' : step.kind),
+      steps,
+      readOnly: false
+    };
   }
 
   private async ensureActiveAgentForChat(
@@ -486,4 +580,15 @@ export class MessageRouter {
       uri: uri.toString()
     };
   }
+
+  private readonly toInstructionSummary = (
+    file: import('./instructionRegistry').InstructionFile
+  ): import('./models').InstructionFileSummary => ({
+    id: file.id,
+    path: file.path,
+    kind: file.kind,
+    size: file.size,
+    keywords: file.keywords,
+    updatedAt: file.updatedAt
+  });
 }

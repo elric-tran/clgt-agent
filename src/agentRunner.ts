@@ -3,6 +3,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { ChangeLog } from './changeLog';
 import { buildIndex } from './indexer';
+import { buildInstructionContext } from './instructionRegistry';
 import { AIAgentProfile, ChatFileContext, ChatMessage, ProviderConfig, TaskModelRoute } from './models';
 import { completeWithProvider } from './providers';
 import { generateSummary } from './summary';
@@ -10,7 +11,14 @@ import { getAgentRoot, getWorkspaceRoot, readText } from './storage';
 import { AgentStore, ProviderStore, SecretStore } from './stores';
 import { CommandResult, runCommand, writeFile } from './tools';
 import { writePlanFile } from './userConfig';
-import { buildWorkflowStepPrompt, getWorkflow, WorkflowNodeType } from './workflows';
+import {
+  buildWorkflowStepPrompt,
+  getWorkflow,
+  getWorkflowSteps,
+  WorkflowNodeType,
+  WorkflowStep,
+  WorkflowTemplate
+} from './workflows';
 
 function messageId(): string {
   return `msg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -42,8 +50,9 @@ export class AgentRunner {
   async run(
     sessionId: string,
     content: string,
-    workflowId: string | undefined,
+    selectedWorkflow: WorkflowTemplate | undefined,
     files: ChatFileContext[],
+    instructionIds: string[],
     emit: (message: ChatMessage) => void,
     thinking: (active: boolean, node?: WorkflowNodeType) => void,
     requestClarification: (
@@ -59,7 +68,8 @@ export class AgentRunner {
     emit(userMessage);
 
     const agent = await this.getActiveAgent();
-    const workflow = getWorkflow(workflowId || agent.workflowId);
+    const workflow = selectedWorkflow || getWorkflow(agent.workflowId);
+    const steps = getWorkflowSteps(workflow);
 
     let context = '';
     if (agent.enableRepoMindmap) {
@@ -70,33 +80,50 @@ export class AgentRunner {
       }
     }
     const fileContext = await this.getAttachedFileContext(files);
-    context = [context, fileContext].filter(Boolean).join('\n\n');
+    const instructionContext = buildInstructionContext(instructionIds);
+    context = [instructionContext, context, fileContext].filter(Boolean).join('\n\n');
 
     const task = `${agent.description ? `${agent.description}\n\n` : ''}${content}`;
     const results: Array<{ node: WorkflowNodeType; content: string }> = [];
     let planPath: string | undefined;
     let clarificationAnswers: string[] = [];
     let verificationComplete = false;
+    const loopCounts = new Map<string, number>();
+    let stepIndex = 0;
+    let totalExecutions = 0;
 
     try {
-      for (const node of workflow.nodes) {
+      while (stepIndex < steps.length) {
+        totalExecutions += 1;
+        if (totalExecutions > 100) throw new Error('Mode stopped after 100 step executions to prevent an infinite loop.');
         if (cancellation.token.isCancellationRequested) throw new vscode.CancellationError();
-        if (verificationComplete && (node === 'build' || node === 'testing')) continue;
-        const route = this.getTaskRoute(agent, node);
+        const step = steps[stepIndex];
+        const node = this.stepNode(step);
+        if (verificationComplete && (node === 'build' || node === 'testing')) {
+          stepIndex += 1;
+          continue;
+        }
+        const route = step.providerId && step.model
+          ? { providerId: step.providerId, model: step.model }
+          : this.getTaskRoute(agent, node);
         const provider = await this.getProvider(route.providerId);
         const stepAgent: AIAgentProfile = {
           ...agent,
           providerId: route.providerId,
           model: route.model
         };
-        emit(this.createMessage('system', `${node} · ${provider.name} / ${route.model}`));
+        emit(this.createMessage('system', `${step.name} · ${provider.name} / ${route.model}`));
         thinking(true, node);
 
-        let prompt = buildWorkflowStepPrompt(node, task, context, results);
-        if (node === 'architect') {
-          prompt = this.buildArchitectPrompt(task, context, clarificationAnswers);
-        } else if (node === 'code' && planPath) {
-          prompt = this.buildCodePrompt(task, planPath, fileContext);
+        let prompt = step.kind === 'prompt'
+          ? this.buildCustomStepPrompt(step, task, context, results)
+          : buildWorkflowStepPrompt(node, task, context, results);
+        if (step.kind === 'architect') {
+          prompt = this.buildArchitectPrompt(task, context, clarificationAnswers, step.prompt);
+        } else if (step.kind === 'code' && planPath) {
+          prompt = this.buildCodePrompt(task, planPath, fileContext, step.prompt);
+        } else if (step.kind === 'code') {
+          prompt = this.buildAdHocCodePrompt(task, context, results, step.prompt);
         }
 
         const result = await completeWithProvider({
@@ -107,7 +134,8 @@ export class AgentRunner {
         }, this.secretStore);
         thinking(false, node);
 
-        if (node === 'architect') {
+        let stepOutput = result;
+        if (step.kind === 'architect') {
           const architectResult = this.parseArchitectResult(result);
           if (architectResult.questions.length > 0) {
             thinking(false, node);
@@ -119,7 +147,7 @@ export class AgentRunner {
             );
             thinking(true, node);
             const clarifiedResult = await completeWithProvider({
-              prompt: this.buildArchitectPrompt(task, context, clarificationAnswers),
+              prompt: this.buildArchitectPrompt(task, context, clarificationAnswers, step.prompt),
               agent: stepAgent,
               provider,
               token: cancellation.token
@@ -133,10 +161,12 @@ export class AgentRunner {
           planPath = writePlanFile(sessionId, architectResult.plan);
           results.push({ node, content: architectResult.plan });
           emit(this.createMessage('assistant', `Plan saved to ${planPath}\n\n${architectResult.plan}`));
+          stepOutput = architectResult.plan;
+          stepIndex = this.nextStepIndex(steps, stepIndex, step, stepOutput, loopCounts);
           continue;
         }
 
-        if (node === 'code') {
+        if (step.kind === 'code') {
           const operations = this.parseCodeOperations(result);
           const items = operations.map((operation) => `${operation.action}: ${operation.path}`);
           requestApproval(items, agent.enableAutoApproveCode);
@@ -163,11 +193,14 @@ export class AgentRunner {
             cancellation.token
           );
           verificationComplete = true;
+          stepOutput = applied;
+          stepIndex = this.nextStepIndex(steps, stepIndex, step, stepOutput, loopCounts);
           continue;
         }
 
         results.push({ node, content: result });
-        emit(this.createMessage('assistant', `## ${node}\n${result}`));
+        emit(this.createMessage('assistant', `## ${step.name}\n${result}`));
+        stepIndex = this.nextStepIndex(steps, stepIndex, step, stepOutput, loopCounts);
       }
 
       const response = results.map((result) => `## ${result.node}\n${result.content}`).join('\n\n');
@@ -185,6 +218,52 @@ export class AgentRunner {
       }
       cancellation.dispose();
     }
+  }
+
+  private buildCustomStepPrompt(
+    step: WorkflowStep,
+    task: string,
+    context: string,
+    previousResults: Array<{ node: WorkflowNodeType; content: string }>
+  ): string {
+    return [
+      `Task: ${task}`,
+      '',
+      `Current mode step: ${step.name}`,
+      step.prompt,
+      '',
+      'Complete only this step. Return a concrete result that later steps can use.',
+      previousResults.length
+        ? `\nPrevious step results:\n${previousResults.map((item) => `## ${item.node}\n${item.content}`).join('\n\n')}`
+        : '',
+      context ? `\nRepository and attached file context:\n${context}` : ''
+    ].filter(Boolean).join('\n');
+  }
+
+  private stepNode(step: WorkflowStep): WorkflowNodeType {
+    return step.kind === 'prompt' ? 'custom' : step.kind;
+  }
+
+  private nextStepIndex(
+    steps: WorkflowStep[],
+    currentIndex: number,
+    step: WorkflowStep,
+    output: string,
+    loopCounts: Map<string, number>
+  ): number {
+    if (!step.loop) return currentIndex + 1;
+    const value = step.loop.value || '';
+    const matches = step.loop.condition === 'always'
+      || (step.loop.condition === 'contains' && output.includes(value))
+      || (step.loop.condition === 'not_contains' && !output.includes(value));
+    if (!matches) return currentIndex + 1;
+
+    const count = loopCounts.get(step.id) || 0;
+    if (count >= step.loop.maxIterations) return currentIndex + 1;
+    const targetIndex = steps.findIndex((item) => item.id === step.loop!.targetStepId);
+    if (targetIndex < 0) return currentIndex + 1;
+    loopCounts.set(step.id, count + 1);
+    return targetIndex;
   }
 
   stop(sessionId: string): boolean {
@@ -213,11 +292,12 @@ export class AgentRunner {
     return true;
   }
 
-  private buildArchitectPrompt(task: string, context: string, answers: string[]): string {
+  private buildArchitectPrompt(task: string, context: string, answers: string[], instruction = ''): string {
     return [
       `Task: ${task}`,
       '',
       'You are the architect. Before planning, decide whether important requirements are missing.',
+      instruction ? `Mode instruction: ${instruction}` : '',
       'Ask at most 3 questions and only when the answer materially changes implementation.',
       'Each question must have 2 or 3 concise options and one safe default.',
       'If clarification is needed, return JSON only:',
@@ -230,7 +310,7 @@ export class AgentRunner {
     ].filter(Boolean).join('\n');
   }
 
-  private buildCodePrompt(task: string, planPath: string, fileContext = ''): string {
+  private buildCodePrompt(task: string, planPath: string, fileContext = '', instruction = ''): string {
     const plan = readText(planPath);
     if (!plan) {
       throw new Error(`The canonical plan file could not be read: ${planPath}`);
@@ -240,6 +320,7 @@ export class AgentRunner {
       `Canonical plan file: ${planPath}`,
       '',
       'You are the implementation model. The architect has completed the design.',
+      instruction ? `Mode instruction: ${instruction}` : '',
       'Follow the plan directly. Do not redesign or infer a different architecture.',
       'Return JSON only. Include the complete final content for every file to create or update.',
       '{"operations":[{"action":"create|update","path":"relative/workspace/path","content":"complete file content"}]}',
@@ -251,6 +332,25 @@ export class AgentRunner {
       'Relevant workspace files:',
       this.getCodeContext(plan)
     ].join('\n');
+  }
+
+  private buildAdHocCodePrompt(
+    task: string,
+    context: string,
+    results: Array<{ node: WorkflowNodeType; content: string }>,
+    instruction: string
+  ): string {
+    return [
+      `Task: ${task}`,
+      '',
+      'You are the implementation model.',
+      instruction ? `Mode instruction: ${instruction}` : '',
+      'Return JSON only. Include the complete final content for every file to create or update.',
+      '{"operations":[{"action":"create|update","path":"relative/workspace/path","content":"complete file content"}]}',
+      'Do not return markdown fences or explanations.',
+      results.length ? `\nPrevious step results:\n${results.map((item) => `## ${item.node}\n${item.content}`).join('\n\n')}` : '',
+      context ? `\nRepository and attached file context:\n${context}` : ''
+    ].filter(Boolean).join('\n');
   }
 
   private buildVerificationPrompt(

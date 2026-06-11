@@ -74,6 +74,15 @@ export type WorkspaceFileMatch = {
   uri: string;
 };
 
+export type InstructionFileSummary = {
+  id: string;
+  path: string;
+  kind: 'skill' | 'rule' | 'instruction';
+  size: number;
+  keywords: string[];
+  updatedAt: string;
+};
+
 export type CreateAgentInput = Partial<
   Pick<
     AIAgentProfile,
@@ -125,6 +134,7 @@ export type WebviewMessage =
       model?: string;
       taskRoutes?: Partial<Record<WorkflowNodeType, TaskModelRoute>>;
       files?: ChatFileContext[];
+      instructionIds?: string[];
     }
   | { type: 'chat:contextSearch'; query: string }
   | { type: 'chat:contextResolveDrop'; requestId: string; values: string[] }
@@ -133,8 +143,11 @@ export type WebviewMessage =
   | { type: 'chat:clarificationResponse'; sessionId: string; answers: string[] }
   | { type: 'chat:approvalResponse'; sessionId: string; approved: boolean }
   | { type: 'workflows:list' }
+  | { type: 'workflows:save'; workflow: WorkflowTemplate }
+  | { type: 'workflows:delete'; workflowId: string }
   | { type: 'prompts:list' }
   | { type: 'repo:index' }
+  | { type: 'instructions:refresh' }
   | { type: 'tools:runCommand'; command: string }
   | { type: 'reports:generate' }
   | { type: 'providers:openApiKeyPage' }
@@ -149,6 +162,8 @@ export type ExtensionMessage =
       activeAgentId?: string;
       workflows: WorkflowTemplate[];
       models: Record<ProviderType, string[]>;
+      instructions: InstructionFileSummary[];
+      instructionsScannedAt: string;
     }
   | { type: 'providers:list:result'; providers: ProviderConfig[] }
   | { type: 'providers:connect:result'; provider: ProviderConfig }
@@ -176,8 +191,11 @@ export type ExtensionMessage =
   | { type: 'chat:contextResolveDrop:result'; requestId: string; files: WorkspaceFileMatch[] }
   | { type: 'chat:contextPick:result'; files: WorkspaceFileMatch[] }
   | { type: 'workflows:list:result'; workflows: WorkflowTemplate[] }
+  | { type: 'workflows:save:result'; workflow: WorkflowTemplate }
+  | { type: 'workflows:delete:result'; workflowId: string }
   | { type: 'prompts:list:result'; prompts: Array<{ id: string; name: string; content: string }> }
   | { type: 'repo:index:result'; fileCount: number; symbolCount: number }
+  | { type: 'instructions:list:result'; files: InstructionFileSummary[]; scannedAt: string }
   | { type: 'tools:runCommand:result'; ok: boolean; exitCode: number; stdout: string; stderr: string }
   | { type: 'reports:generate:result'; reportPath: string }
   | { type: 'status'; message: string }

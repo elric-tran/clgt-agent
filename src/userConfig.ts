@@ -2,11 +2,13 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { AIAgentProfile, ProviderConfig } from './models';
+import { WorkflowTemplate } from './workflows';
 
 export type UserConfig = {
   version: 1;
   providers: ProviderConfig[];
   agents: AIAgentProfile[];
+  workflows?: WorkflowTemplate[];
   activeAgentId?: string;
   updatedAt: string;
 };

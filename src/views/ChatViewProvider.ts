@@ -128,7 +128,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     /* Tabs */
     .tabs {
-      display: grid; grid-template-columns: repeat(5, 1fr); gap: 4px;
+      display: grid; grid-template-columns: repeat(6, 1fr); gap: 4px;
       border: 0;
       border-bottom: 1px solid var(--border);
       padding: 6px 8px;
@@ -305,6 +305,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     .provider-config summary::-webkit-details-marker { display: none; }
     .provider-config-body { display: flex; flex-direction: column; gap: 8px; padding: 2px 11px 11px; }
     .provider-models { max-height: 110px; overflow: auto; font-size: 11px; color: var(--muted); }
+    .mode-step {
+      border: 1px solid var(--border); border-radius: 7px; padding: 9px;
+      background: var(--panel-soft); display: flex; flex-direction: column; gap: 8px;
+    }
+    .mode-step-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .mode-step-actions { display: flex; gap: 5px; }
+    .mode-step-actions button { padding: 4px 7px; min-width: 28px; }
+    .mode-loop { border-top: 1px solid var(--border); padding-top: 8px; display: flex; flex-direction: column; gap: 7px; }
+    .instruction-list { display: flex; flex-direction: column; gap: 4px; max-height: 340px; overflow-y: auto; }
+    .instruction-folder { border-left: 1px solid var(--border); margin-left: 5px; padding-left: 7px; }
+    .instruction-folder > summary {
+      display: flex; align-items: center; gap: 7px; min-height: 28px; cursor: pointer;
+      list-style: none; font-size: 11px; font-weight: 700; user-select: none;
+    }
+    .instruction-folder > summary::-webkit-details-marker { display: none; }
+    .instruction-folder-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .instruction-folder-count { color: var(--muted); font-size: 10px; font-weight: 400; }
+    .instruction-folder input { width: auto; }
+    .instruction-item {
+      display: grid; grid-template-columns: auto 1fr; gap: 8px; align-items: flex-start;
+      padding: 6px 7px; border: 1px solid var(--border); border-radius: 6px; background: var(--panel-soft);
+    }
+    .instruction-item input { width: auto; margin-top: 2px; }
+    .instruction-path { font-size: 11px; font-weight: 600; word-break: break-all; }
+    .instruction-meta { color: var(--muted); font-size: 10px; margin-top: 2px; }
 
     .muted { color: var(--muted); font-size: 12px; }
     .tool-log { white-space: pre-wrap; word-break: break-word; max-height: 160px; overflow: auto; font-size: 12px; padding: 6px; background: var(--panel); border-radius: 4px; }
@@ -326,6 +351,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       <button class="tab-btn active" data-page="chat">Chat</button>
       <button class="tab-btn" data-page="providers">Providers</button>
       <button class="tab-btn" data-page="agents">Agents</button>
+      <button class="tab-btn" data-page="modes">Modes</button>
       <button class="tab-btn" data-page="tools">Tools</button>
       <button class="tab-btn" data-page="settings">Settings</button>
     </nav>
@@ -430,9 +456,39 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       </div>
     </div>
 
+    <!-- Modes Page -->
+    <div id="page-modes" class="page">
+      <div class="page-scroll stack">
+        <div class="provider-page-head">
+          <div class="header-title">Create Mode</div>
+          <div class="muted">Build a top-to-bottom pipeline. Each step owns its prompt, provider, model, and optional bounded loop.</div>
+          <div class="muted">For reliable loops, ask a step to return a marker such as NEEDS_CHANGES, then use an Output contains condition.</div>
+        </div>
+        <label>Saved mode<select id="modeSelect"></select></label>
+        <div class="row">
+          <button id="newMode" class="secondary">New Mode</button>
+          <button id="deleteMode" class="danger">Delete Mode</button>
+        </div>
+        <label>Mode name<input id="modeName" placeholder="Review and implement"></label>
+        <div id="modeSteps" class="stack"></div>
+        <button id="addModeStep" class="secondary">Add Step</button>
+        <button id="saveMode">Save Mode</button>
+      </div>
+    </div>
+
     <!-- Tools Page -->
     <div id="page-tools" class="page">
       <div class="page-scroll stack">
+        <div class="card">
+          <div class="card-title"><span>Agent Skills & Rules</span><span id="instructionScanTime" class="muted"></span></div>
+          <div class="muted">Selected files are loaded from cache and prepended to every chat request.</div>
+          <div class="row">
+            <button id="selectAllInstructions" class="secondary">Select all</button>
+            <button id="clearInstructions" class="secondary">Select none</button>
+          </div>
+          <button id="refreshInstructions">Refresh files</button>
+          <div id="instructionList" class="instruction-list"></div>
+        </div>
         <div class="row">
           <button id="indexRepo">Index Repo</button>
           <button id="genSummary" class="secondary">Summary</button>
@@ -483,7 +539,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       contextQuery: '',
       contextSearchTimer: undefined,
       contextActiveIndex: 0,
-      dropRequestId: undefined
+      dropRequestId: undefined,
+      modeDraft: undefined,
+      pendingModeModelDetection: undefined,
+      instructions: [],
+      selectedInstructionIds: new Set(),
+      instructionsScannedAt: '',
+      pendingInstructionSelectionPaths: undefined,
+      pendingInstructionSelectAll: false
     };
 
     const $ = (id) => document.getElementById(id);
@@ -528,10 +591,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       renderAgentFormOptions();
       renderChatProviderControls();
       renderTaskRoutes();
+      renderModesPage();
+      renderInstructions();
     }
 
     function renderWorkflows() {
       for (const sel of [$('chatWorkflow'), $('agentWorkflow')]) {
+        const currentValue = sel.value;
         sel.innerHTML = '';
         state.workflows.forEach(w => {
           const opt = document.createElement('option');
@@ -539,6 +605,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           opt.textContent = w.name;
           sel.appendChild(opt);
         });
+        if (state.workflows.some(item => item.id === currentValue)) sel.value = currentValue;
       }
     }
 
@@ -741,6 +808,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       root.innerHTML = '';
       if (!workflow) return;
 
+      if (workflow.steps && workflow.steps.length) {
+        workflow.steps.forEach(step => {
+          const provider = state.providers.find(item => item.id === step.providerId);
+          const row = document.createElement('div');
+          row.className = 'route-row';
+          row.innerHTML =
+            '<div><div class="route-role">' + esc(step.name) + '</div><div class="route-summary">' + esc(step.kind) + '</div></div>' +
+            '<div class="route-controls"><div class="route-summary">' + esc(provider ? provider.name : step.providerId) + ' / ' + esc(step.model) + '</div></div>';
+          root.appendChild(row);
+        });
+        return;
+      }
+
       workflow.nodes.forEach(node => {
         const route = routeValue(node);
         const row = document.createElement('div');
@@ -766,13 +846,188 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     function collectTaskRoutes() {
       const routes = {};
-      document.querySelectorAll('.route-row').forEach(row => {
+      $('taskRoutes').querySelectorAll('.route-row').forEach(row => {
+        const provider = row.querySelector('[data-route-provider]');
+        const model = row.querySelector('[data-route-model]');
+        if (!row.dataset.node || !provider || !model) return;
         routes[row.dataset.node] = {
-          providerId: row.querySelector('[data-route-provider]').value,
-          model: row.querySelector('[data-route-model]').value
+          providerId: provider.value,
+          model: model.value
         };
       });
       return routes;
+    }
+
+    function createModeStep(index) {
+      const provider = state.providers.find(item => item.isConnected) || state.providers[0];
+      const models = provider ? state.models[provider.type] || [] : [];
+      return {
+        id: 'step-' + Date.now().toString(36) + '-' + index + '-' + Math.random().toString(36).slice(2, 6),
+        name: 'Step ' + (index + 1),
+        kind: 'prompt',
+        prompt: 'Complete this step using the task, attached files, and previous step results.',
+        providerId: provider?.id || '',
+        model: models[0] || provider?.defaultModel || '',
+        loop: undefined
+      };
+    }
+
+    function cloneMode(mode) {
+      return mode ? JSON.parse(JSON.stringify(mode)) : undefined;
+    }
+
+    function selectedSavedMode() {
+      return state.workflows.find(item => item.id === $('modeSelect').value && !item.readOnly);
+    }
+
+    function startModeDraft(mode) {
+      state.modeDraft = cloneMode(mode) || {
+        id: 'mode-' + Date.now().toString(36),
+        name: 'Custom Mode',
+        nodes: [],
+        steps: [createModeStep(0)],
+        readOnly: false
+      };
+      renderModesPage();
+    }
+
+    function renderModesPage() {
+      const select = $('modeSelect');
+      if (!select) return;
+      const customModes = state.workflows.filter(item => !item.readOnly && item.steps);
+      const selectedId = state.modeDraft?.id || select.value;
+      select.innerHTML = '<option value="">New custom mode</option>';
+      customModes.forEach(mode => {
+        const option = document.createElement('option');
+        option.value = mode.id;
+        option.textContent = mode.name;
+        option.selected = mode.id === selectedId;
+        select.appendChild(option);
+      });
+
+      if (!state.modeDraft) {
+        state.modeDraft = cloneMode(customModes.find(item => item.id === select.value))
+          || { id: 'mode-' + Date.now().toString(36), name: 'Custom Mode', nodes: [], steps: [createModeStep(0)], readOnly: false };
+      }
+      $('modeName').value = state.modeDraft.name || '';
+      $('deleteMode').disabled = !customModes.some(item => item.id === state.modeDraft.id);
+      renderModeSteps();
+    }
+
+    function renderModeSteps() {
+      const root = $('modeSteps');
+      root.innerHTML = '';
+      const steps = state.modeDraft?.steps || [];
+      steps.forEach((step, index) => {
+        const card = document.createElement('div');
+        card.className = 'mode-step';
+        card.dataset.stepId = step.id;
+        card.innerHTML =
+          '<div class="mode-step-head"><strong>' + esc((index + 1) + '. ' + step.name) + '</strong><div class="mode-step-actions">'
+          + '<button type="button" class="secondary" data-mode-action="up" title="Move up">↑</button>'
+          + '<button type="button" class="secondary" data-mode-action="down" title="Move down">↓</button>'
+          + '<button type="button" class="danger" data-mode-action="remove" title="Remove">×</button></div></div>'
+          + '<label>Step name<input data-step-field="name" value="' + esc(step.name) + '"></label>'
+          + '<label>Behavior<select data-step-field="kind"><option value="prompt">Prompt</option><option value="architect">Architect</option><option value="code">Code</option></select></label>'
+          + '<label>Instruction<textarea data-step-field="prompt"></textarea></label>'
+          + '<div class="row"><label>Provider<select data-step-field="providerId"></select></label><label>Model<select data-step-field="model"></select></label></div>'
+          + '<label style="flex-direction:row;align-items:center;gap:7px;color:var(--vscode-foreground);"><input data-step-loop-enabled type="checkbox" style="width:auto;"> Loop after this step</label>'
+          + '<div class="mode-loop" data-step-loop>'
+          + '<label>Jump to<select data-loop-field="targetStepId"></select></label>'
+          + '<div class="row"><label>Condition<select data-loop-field="condition"><option value="contains">Output contains</option><option value="not_contains">Output does not contain</option><option value="always">Always</option></select></label><label>Maximum loops<input data-loop-field="maxIterations" type="number" min="1" max="10"></label></div>'
+          + '<label>Condition text<input data-loop-field="value" placeholder="Example: NEEDS_CHANGES"></label></div>';
+        root.appendChild(card);
+
+        card.querySelector('[data-step-field="kind"]').value = step.kind;
+        card.querySelector('[data-step-field="prompt"]').value = step.prompt;
+        const providerSelect = card.querySelector('[data-step-field="providerId"]');
+        state.providers.forEach(provider => {
+          const option = document.createElement('option');
+          option.value = provider.id;
+          option.textContent = provider.name + (provider.isConnected ? '' : ' (not connected)');
+          option.selected = provider.id === step.providerId;
+          providerSelect.appendChild(option);
+        });
+        fillModelSelect(card.querySelector('[data-step-field="model"]'), providerSelect.value, step.model);
+        const target = card.querySelector('[data-loop-field="targetStepId"]');
+        steps.forEach(targetStep => {
+          const option = document.createElement('option');
+          option.value = targetStep.id;
+          option.textContent = targetStep.name;
+          option.selected = targetStep.id === step.loop?.targetStepId;
+          target.appendChild(option);
+        });
+        card.querySelector('[data-step-loop-enabled]').checked = Boolean(step.loop);
+        card.querySelector('[data-step-loop]').style.display = step.loop ? 'flex' : 'none';
+        card.querySelector('[data-loop-field="condition"]').value = step.loop?.condition || 'contains';
+        card.querySelector('[data-loop-field="maxIterations"]').value = String(step.loop?.maxIterations || 1);
+        card.querySelector('[data-loop-field="value"]').value = step.loop?.value || '';
+      });
+    }
+
+    function syncModeDraftFromDom() {
+      if (!state.modeDraft) return;
+      state.modeDraft.name = $('modeName').value.trim() || 'Custom Mode';
+      document.querySelectorAll('.mode-step').forEach(card => {
+        const step = state.modeDraft.steps.find(item => item.id === card.dataset.stepId);
+        if (!step) return;
+        step.name = card.querySelector('[data-step-field="name"]').value.trim() || 'Step';
+        step.kind = card.querySelector('[data-step-field="kind"]').value;
+        step.prompt = card.querySelector('[data-step-field="prompt"]').value;
+        step.providerId = card.querySelector('[data-step-field="providerId"]').value;
+        step.model = card.querySelector('[data-step-field="model"]').value;
+        if (card.querySelector('[data-step-loop-enabled]').checked) {
+          step.loop = {
+            targetStepId: card.querySelector('[data-loop-field="targetStepId"]').value,
+            condition: card.querySelector('[data-loop-field="condition"]').value,
+            value: card.querySelector('[data-loop-field="value"]').value,
+            maxIterations: Number(card.querySelector('[data-loop-field="maxIterations"]').value) || 1
+          };
+        } else {
+          step.loop = undefined;
+        }
+      });
+      state.modeDraft.nodes = state.modeDraft.steps.map(step => step.kind === 'prompt' ? 'custom' : step.kind);
+    }
+
+    function providerNeedsModelDetection(provider) {
+      if (!provider || !['copilot', 'vscode-lm'].includes(provider.type)) return false;
+      const models = state.models[provider.type] || [];
+      return models.length === 0
+        || models.every(model => model === 'auto' || model === 'copilot-chat');
+    }
+
+    function detectModelsForModeStep(card) {
+      const providerId = card.querySelector('[data-step-field="providerId"]').value;
+      const provider = state.providers.find(item => item.id === providerId);
+      if (!providerNeedsModelDetection(provider)) return false;
+      if (state.pendingModeModelDetection?.stepId === card.dataset.stepId) return true;
+      syncModeDraftFromDom();
+      state.pendingModeModelDetection = {
+        stepId: card.dataset.stepId,
+        providerType: provider.type
+      };
+      post({
+        type: provider.type === 'copilot' ? 'providers:copilotModels' : 'providers:vscodeLmModels'
+      });
+      setStatus('Detecting models for ' + provider.name + '...');
+      return true;
+    }
+
+    function applyDetectedModelsToPendingStep(providerType, models) {
+      const pending = state.pendingModeModelDetection;
+      if (!pending || pending.providerType !== providerType) return;
+      const step = state.modeDraft?.steps.find(item => item.id === pending.stepId);
+      if (step && models.length > 0 && (!step.model || step.model === 'auto' || step.model === 'copilot-chat')) {
+        step.model = models[0].id;
+      }
+      state.pendingModeModelDetection = undefined;
+      renderAll();
+      const select = document.querySelector('.mode-step[data-step-id="' + pending.stepId + '"] [data-step-field="model"]');
+      select?.focus();
+      if (typeof select?.showPicker === 'function') {
+        try { select.showPicker(); } catch {}
+      }
     }
 
     function setRunning(running, node) {
@@ -782,6 +1037,90 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       $('sendContent').innerHTML = running
         ? '<span class="spinner"></span><span>' + esc(node ? 'Cancel ' + node : 'Cancel') + '</span>'
         : 'Send';
+    }
+
+    function renderInstructions() {
+      const root = $('instructionList');
+      if (!root) return;
+      root.innerHTML = '';
+      $('instructionScanTime').textContent = state.instructionsScannedAt
+        ? new Date(state.instructionsScannedAt).toLocaleTimeString()
+        : 'Not scanned';
+      if (state.instructions.length === 0) {
+        root.innerHTML = '<div class="muted">No skill, rule, or instruction files found.</div>';
+        return;
+      }
+      const tree = { folders: new Map(), files: [] };
+      state.instructions.forEach(file => {
+        const parts = file.path.split('/');
+        let node = tree;
+        parts.slice(0, -1).forEach(part => {
+          if (!node.folders.has(part)) node.folders.set(part, { folders: new Map(), files: [] });
+          node = node.folders.get(part);
+        });
+        node.files.push(file);
+      });
+
+      const renderFile = (file, container) => {
+        const label = document.createElement('label');
+        label.className = 'instruction-item';
+        label.innerHTML =
+          '<input type="checkbox" data-instruction-id="' + esc(file.id) + '"'
+          + (state.selectedInstructionIds.has(file.id) ? ' checked' : '') + '>'
+          + '<div><div class="instruction-path">' + esc(file.path.split('/').pop()) + '</div>'
+          + '<div class="instruction-meta">' + esc(file.kind) + ' · ' + Math.ceil(file.size / 1024) + ' KB'
+          + (file.keywords?.length ? ' · ' + esc(file.keywords.slice(0, 5).join(', ')) : '') + '</div></div>';
+        container.appendChild(label);
+      };
+
+      const collectFiles = (node) => {
+        const files = [...node.files];
+        node.folders.forEach(child => files.push(...collectFiles(child)));
+        return files;
+      };
+
+      const renderFolder = (name, node, parent, parentPath, depth) => {
+        const folderPath = parentPath ? parentPath + '/' + name : name;
+        const descendantFiles = collectFiles(node);
+        const selectedCount = descendantFiles.filter(file => state.selectedInstructionIds.has(file.id)).length;
+        const details = document.createElement('details');
+        details.className = 'instruction-folder';
+        details.open = depth < 2;
+        const summary = document.createElement('summary');
+        summary.innerHTML =
+          '<input type="checkbox" data-instruction-folder="' + esc(folderPath) + '">'
+          + '<span class="instruction-folder-name">' + esc(name) + '</span>'
+          + '<span class="instruction-folder-count">' + selectedCount + '/' + descendantFiles.length + '</span>';
+        details.appendChild(summary);
+        const checkbox = summary.querySelector('[data-instruction-folder]');
+        checkbox.checked = selectedCount === descendantFiles.length;
+        checkbox.indeterminate = selectedCount > 0 && selectedCount < descendantFiles.length;
+        [...node.folders.entries()].sort(([left], [right]) => left.localeCompare(right))
+          .forEach(([childName, child]) => renderFolder(childName, child, details, folderPath, depth + 1));
+        node.files.sort((left, right) => left.path.localeCompare(right.path))
+          .forEach(file => renderFile(file, details));
+        parent.appendChild(details);
+      };
+
+      [...tree.folders.entries()].sort(([left], [right]) => left.localeCompare(right))
+        .forEach(([name, node]) => renderFolder(name, node, root, '', 0));
+      tree.files.sort((left, right) => left.path.localeCompare(right.path))
+        .forEach(file => renderFile(file, root));
+    }
+
+    function updateInstructionCheckboxes() {
+      $('instructionList').querySelectorAll('[data-instruction-id]').forEach(checkbox => {
+        checkbox.checked = state.selectedInstructionIds.has(checkbox.dataset.instructionId);
+      });
+      $('instructionList').querySelectorAll('[data-instruction-folder]').forEach(checkbox => {
+        const prefix = checkbox.dataset.instructionFolder + '/';
+        const files = state.instructions.filter(file => file.path.startsWith(prefix));
+        const selectedCount = files.filter(file => state.selectedInstructionIds.has(file.id)).length;
+        checkbox.checked = files.length > 0 && selectedCount === files.length;
+        checkbox.indeterminate = selectedCount > 0 && selectedCount < files.length;
+        const count = checkbox.parentElement.querySelector('.instruction-folder-count');
+        if (count) count.textContent = selectedCount + '/' + files.length;
+      });
     }
 
     function showThinking(active, node) {
@@ -1142,6 +1481,66 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
       syncActiveAgentFromChatControls();
     });
+    $('modeSelect').addEventListener('change', () => {
+      startModeDraft(selectedSavedMode());
+    });
+    $('newMode').addEventListener('click', () => startModeDraft());
+    $('addModeStep').addEventListener('click', () => {
+      syncModeDraftFromDom();
+      state.modeDraft.steps.push(createModeStep(state.modeDraft.steps.length));
+      renderModesPage();
+    });
+    $('saveMode').addEventListener('click', () => {
+      syncModeDraftFromDom();
+      post({ type: 'workflows:save', workflow: state.modeDraft });
+      setStatus('Saving custom mode...');
+    });
+    $('deleteMode').addEventListener('click', () => {
+      if (!state.modeDraft?.id) return;
+      post({ type: 'workflows:delete', workflowId: state.modeDraft.id });
+    });
+    $('modeSteps').addEventListener('change', (event) => {
+      const card = event.target.closest('.mode-step');
+      if (!card) return;
+      if (event.target.matches('[data-step-field="providerId"]')) {
+        fillModelSelect(card.querySelector('[data-step-field="model"]'), event.target.value, '');
+      }
+      if (event.target.matches('[data-step-loop-enabled]')) {
+        card.querySelector('[data-step-loop]').style.display = event.target.checked ? 'flex' : 'none';
+      }
+      syncModeDraftFromDom();
+    });
+    $('modeSteps').addEventListener('input', syncModeDraftFromDom);
+    $('modeSteps').addEventListener('mousedown', (event) => {
+      const select = event.target.closest('[data-step-field="model"]');
+      const card = event.target.closest('.mode-step');
+      if (!select || !card) return;
+      if (detectModelsForModeStep(card)) event.preventDefault();
+    });
+    $('modeSteps').addEventListener('focusin', (event) => {
+      const select = event.target.closest('[data-step-field="model"]');
+      const card = event.target.closest('.mode-step');
+      if (select && card) detectModelsForModeStep(card);
+    });
+    $('modeName').addEventListener('input', () => {
+      if (state.modeDraft) state.modeDraft.name = $('modeName').value;
+    });
+    $('modeSteps').addEventListener('click', (event) => {
+      const button = event.target.closest('[data-mode-action]');
+      const card = event.target.closest('.mode-step');
+      if (!button || !card || !state.modeDraft) return;
+      syncModeDraftFromDom();
+      const index = state.modeDraft.steps.findIndex(item => item.id === card.dataset.stepId);
+      if (index < 0) return;
+      if (button.dataset.modeAction === 'remove') state.modeDraft.steps.splice(index, 1);
+      if (button.dataset.modeAction === 'up' && index > 0) {
+        [state.modeDraft.steps[index - 1], state.modeDraft.steps[index]] = [state.modeDraft.steps[index], state.modeDraft.steps[index - 1]];
+      }
+      if (button.dataset.modeAction === 'down' && index < state.modeDraft.steps.length - 1) {
+        [state.modeDraft.steps[index + 1], state.modeDraft.steps[index]] = [state.modeDraft.steps[index], state.modeDraft.steps[index + 1]];
+      }
+      renderModesPage();
+    });
 
     $('sendChat').addEventListener('click', () => {
       if (state.isRunning) {
@@ -1165,7 +1564,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         providerId: $('chatProvider')?.value,
         model: $('chatModel')?.value,
         taskRoutes: collectTaskRoutes(),
-        files
+        files,
+        instructionIds: Array.from(state.selectedInstructionIds)
       });
     });
 
@@ -1273,6 +1673,47 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
 
     $('indexRepo').addEventListener('click', () => post({ type: 'repo:index' }));
+    $('refreshInstructions').addEventListener('click', () => {
+      state.pendingInstructionSelectAll = state.instructions.length > 0
+        && state.selectedInstructionIds.size === state.instructions.length;
+      state.pendingInstructionSelectionPaths = new Set(
+        state.instructions
+          .filter(file => state.selectedInstructionIds.has(file.id))
+          .map(file => file.path)
+      );
+      post({ type: 'instructions:refresh' });
+      setStatus('Refreshing agent skills and rules...');
+    });
+    $('selectAllInstructions').addEventListener('click', () => {
+      state.selectedInstructionIds = new Set(state.instructions.map(file => file.id));
+      updateInstructionCheckboxes();
+    });
+    $('clearInstructions').addEventListener('click', () => {
+      state.selectedInstructionIds.clear();
+      updateInstructionCheckboxes();
+    });
+    $('instructionList').addEventListener('change', (event) => {
+      const checkbox = event.target.closest('[data-instruction-id]');
+      if (!checkbox) return;
+      if (checkbox.checked) state.selectedInstructionIds.add(checkbox.dataset.instructionId);
+      else state.selectedInstructionIds.delete(checkbox.dataset.instructionId);
+      updateInstructionCheckboxes();
+    });
+    $('instructionList').addEventListener('click', (event) => {
+      const folder = event.target.closest('[data-instruction-folder]');
+      if (!folder) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const checked = folder.checked;
+      const prefix = folder.dataset.instructionFolder + '/';
+      state.instructions
+        .filter(file => file.path.startsWith(prefix))
+        .forEach(file => {
+          if (checked) state.selectedInstructionIds.add(file.id);
+          else state.selectedInstructionIds.delete(file.id);
+        });
+      setTimeout(updateInstructionCheckboxes, 0);
+    });
     $('genSummary').addEventListener('click', () => post({ type: 'reports:generate' }));
     $('runCommand').addEventListener('click', () => {
       const cmd = $('commandInput').value.trim();
@@ -1320,6 +1761,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           state.activeAgentId = msg.activeAgentId;
           state.workflows = msg.workflows;
           state.models = msg.models;
+          state.instructions = msg.instructions || [];
+          state.instructionsScannedAt = msg.instructionsScannedAt || '';
+          state.selectedInstructionIds = new Set(state.instructions.map(file => file.id));
           renderAll();
           break;
         case 'providers:list:result':
@@ -1337,6 +1781,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           break;
         case 'providers:copilotModels:result': {
           state.models.copilot = msg.models.length ? msg.models.map(m => m.id) : state.models.copilot;
+          if (state.pendingModeModelDetection?.providerType === 'copilot') {
+            applyDetectedModelsToPendingStep('copilot', msg.models);
+            break;
+          }
           renderAll();
           const el = document.querySelector('[data-role="copilot-models"]');
           if (el) {
@@ -1350,6 +1798,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
         case 'providers:vscodeLmModels:result': {
           state.models['vscode-lm'] = msg.models.length ? msg.models.map(m => m.id) : state.models['vscode-lm'];
+          if (state.pendingModeModelDetection?.providerType === 'vscode-lm') {
+            applyDetectedModelsToPendingStep('vscode-lm', msg.models);
+            break;
+          }
           renderAll();
           const el = document.querySelector('[data-role="vscode-lm-models"]');
           if (el) {
@@ -1455,6 +1907,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           setStatus('Indexed ' + msg.fileCount + ' files, ' + msg.symbolCount + ' symbols.');
           $('toolLog').textContent = 'Indexed ' + msg.fileCount + ' files and ' + msg.symbolCount + ' symbols.';
           break;
+        case 'instructions:list:result':
+          const selectedPaths = state.pendingInstructionSelectionPaths;
+          state.instructions = msg.files;
+          state.instructionsScannedAt = msg.scannedAt;
+          state.selectedInstructionIds = state.pendingInstructionSelectAll
+            ? new Set(msg.files.map(file => file.id))
+            : selectedPaths
+            ? new Set(msg.files.filter(file => selectedPaths.has(file.path)).map(file => file.id))
+            : new Set(msg.files.map(file => file.id));
+          state.pendingInstructionSelectionPaths = undefined;
+          state.pendingInstructionSelectAll = false;
+          renderInstructions();
+          setStatus('Loaded ' + msg.files.length + ' skill/rule file(s).');
+          break;
         case 'tools:runCommand:result':
           $('toolLog').textContent = [msg.stdout, msg.stderr].filter(Boolean).join('\\n') || ('Exit code: ' + msg.exitCode);
           setStatus(msg.ok ? 'Command succeeded.' : 'Command failed (exit ' + msg.exitCode + ').');
@@ -1464,7 +1930,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           break;
         case 'workflows:list:result':
           state.workflows = msg.workflows;
-          renderWorkflows();
+          if (state.modeDraft) {
+            const saved = state.workflows.find(item => item.id === state.modeDraft.id);
+            if (saved) state.modeDraft = cloneMode(saved);
+          }
+          renderAll();
+          break;
+        case 'workflows:save:result':
+          state.modeDraft = cloneMode(msg.workflow);
+          setStatus('Mode saved: ' + msg.workflow.name);
+          break;
+        case 'workflows:delete:result':
+          state.modeDraft = undefined;
+          setStatus('Mode deleted.');
           break;
         case 'status':
           setStatus(msg.message);
